@@ -917,6 +917,7 @@ final class SyncBridge {
         reconcileLiveTasks()
         // Pages a Mac sent while Yab was away, kept in the journal.
         takePages()
+        Entrances.resumeShared()
         probe?.say("pending", "\(pending)")
     }
 
@@ -989,6 +990,7 @@ final class SyncBridge {
             // Caught up: a joining iPhone takes the account's spaces now,
             // and from here on writes its own.
             takeAccount()
+            Entrances.resumeShared()
             pruneEmptyPersonals()
             countPending()
             wantsHandoff = true
@@ -1259,6 +1261,7 @@ final class SyncBridge {
     /// closes. What is left waits in the journal for the next launch.
     func wentToBack() {
         flushLocal()
+        publishShareContext()
         guard let engine else { return }
         // Left now: a Mac offers this page for a minute from here, and hears
         // it before the line closes (the presence goes ahead of the pause).
@@ -2481,6 +2484,9 @@ final class SyncBridge {
 
     /// The journal, key, token and id let go: what Join Again and Turn Off share.
     private func forgetAccount(keepingKey: Bool = false) {
+        if setup?.ownWorld == false, let file = SharedLinkSyncContext.file(for: .shared) {
+            try? FileManager.default.removeItem(at: file)
+        }
         folderArtwork.reset()
         settings.importSearchPreferences(engine: nil, customTemplate: nil)
         importShield([:])
@@ -2499,6 +2505,49 @@ final class SyncBridge {
         writing = false
         ready = false
         line = .off
+    }
+
+    /// The share extension uses only the last ordinary space's tab records.
+    /// It never needs the account's chats, history or credentials in a file.
+    private func publishShareContext() {
+        guard app?.isFixture == false, setup?.ownWorld == false, let context = shareContext() else { return }
+        try? context.save(for: .shared)
+    }
+
+    func shareContext() -> SharedLinkSyncContext? {
+        guard let app, let engine, ready, writing else { return nil }
+        let local = app.browser.space.isPrivate ? app.browser.ordinarySpaceID : app.browser.spaceID
+        guard let space = ids.known(local),
+              engine.journal.record(.init(collection: SyncCollection.space, id: space)).flatMap(SyncSpace.init) != nil else { return nil }
+        let row = engine.row(space)
+        let records = (row.pins + row.kept + row.today).compactMap {
+            engine.journal.record(.init(collection: SyncCollection.tab, id: $0.id))
+        }
+        return SharedLinkSyncContext(account: engine.seal.account, device: engine.device,
+                                     base: engine.options.base, space: space, tabs: records,
+                                     lastOrder: row.kept.last?.order)
+    }
+
+    /// Nil keeps the ordinary local path (Sync is off or the account has
+    /// changed). False leaves the queue entry for a later import attempt.
+    func importShared(_ link: SharedLink) -> Bool? {
+        guard let payload = SharedLinkSyncRecord.read(link) else { return nil }
+        guard let engine else {
+            // A journal that failed to open is not Sync being turned off.
+            // Keep its saved identity until the app can import it safely.
+            return setup?.keys.local?.account == payload.account ? false : nil
+        }
+        guard payload.account == engine.seal.account else { return nil }
+        guard ready, writing else { return false }
+        do {
+            let record = try engine.journal.importLocal(payload.record)
+            engine.client.kick()
+            receive(SyncBatch(origin: .remote, changes: engine.changes(for: record)))
+            return true
+        } catch {
+            log.error("shared tab import: \(String(describing: error), privacy: .public)")
+            return false
+        }
     }
 
     /// yab://join/<code>, the Camera on a Mac's Add a Device code: joining by

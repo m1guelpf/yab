@@ -281,11 +281,16 @@ targets:
       - path: Share
       - path: Sources/Design/DateOrder.swift  # Date >=/<= of our own (DateOrder.swift)
       - path: Sources/Entrances/Shared/SharedLinks.swift
+      - path: Sources/Entrances/Shared/SharedLinkSync.swift
+      - path: Sources/Sync/SyncKeychain.swift
       - path: Sources/Entrances/Shared/YabRoute.swift
       - path: Sources/Entrances/Shared/EntranceLook.swift
       - path: Sources/Entrances/Shared/ShareCard.swift
       - path: Sources/Design/Art.xcassets
       - path: Sources/Design/Glyphs.xcassets
+    dependencies:
+      - target: SyncKit
+        embed: false
     info:
       path: Share/Info.plist
       properties:

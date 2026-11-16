@@ -132,6 +132,11 @@ public nonisolated struct SyncKeychain: Sendable {
     /// Mac's, kept on this iPhone only.
     public var deviceID: String { (try? savedDeviceID()) ?? "" }
 
+    /// Extensions can use an existing identity, but never create one.
+    public var existingDeviceID: String? {
+        read("device", synced: false, group: ownGroup).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
     /// Never start a foreground or background line with an identity that
     /// changes after relaunch because the keychain refused its first write.
     public func savedDeviceID() throws -> String {

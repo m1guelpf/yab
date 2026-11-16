@@ -22,6 +22,9 @@ struct SharedLink: Codable, Equatable, Sendable {
     /// The page's title as the sharing app said it, if it did.
     var title: String?
     var date: Date
+    /// The encrypted-sync record prepared before upload, for the app to
+    /// import with the same identity even if the server's reply was lost.
+    var sync: Data?
 
     init(action: Action, address: String, search: Bool = false, title: String? = nil, date: Date = Date()) {
         self.action = action
@@ -82,15 +85,29 @@ struct SharedLinkQueue: Sendable {
         return true
     }
 
-    /// Everything waiting, oldest first, gone from the queue. A file that
-    /// isn't a link (half a write from an older build) goes too.
-    func take() -> [SharedLink] {
+    /// Accepted links, oldest first, removed only after their import.
+    /// Rejected links stay for a retry. Invalid files are removed too.
+    func take(accept: (SharedLink) -> Bool = { _ in true }) -> [SharedLink] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return entries().compactMap { file in
-            defer { try? FileManager.default.removeItem(at: file) }
-            guard let data = try? Data(contentsOf: file) else { return nil }
-            return try? decoder.decode(SharedLink.self, from: data)
+            guard let data = try? Data(contentsOf: file), let link = try? decoder.decode(SharedLink.self, from: data) else {
+                try? FileManager.default.removeItem(at: file)
+                return nil
+            }
+            guard accept(link) else { return nil }
+            try? FileManager.default.removeItem(at: file)
+            return link
+        }
+    }
+
+    /// Pending records also supply identities for repeated shares before
+    /// the app has opened and refreshed its snapshot.
+    var links: [SharedLink] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return entries().compactMap { file in
+            (try? Data(contentsOf: file)).flatMap { try? decoder.decode(SharedLink.self, from: $0) }
         }
     }
 

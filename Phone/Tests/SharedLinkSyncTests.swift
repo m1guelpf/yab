@@ -1,0 +1,185 @@
+import Foundation
+import SyncKit
+import XCTest
+@testable import YabPhone
+
+final class SharedLinkSyncTests: XCTestCase {
+    private var folder: URL!
+    private let space = UUID().uuidString
+    private let base = URL(string: "https://sync.test")!
+
+    override func setUp() {
+        SyncCollection.register()
+        folder = FileManager.default.temporaryDirectory.appendingPathComponent("share-sync-\(UUID())")
+    }
+
+    override func tearDown() { try? FileManager.default.removeItem(at: folder) }
+
+    private func context(_ seal: Seal, tabs: [Record] = []) -> SharedLinkSyncContext {
+        .init(account: seal.account, device: "phone", base: base, space: space, tabs: tabs, lastOrder: "V")
+    }
+
+    private func prepared(_ seal: Seal) throws -> SharedLink {
+        try context(seal).prepare(.init(action: .keep, address: "example.com/article", title: "An article"), pending: [])
+    }
+
+    private func server(_ seal: Seal) -> SyncMemoryServer {
+        let server = SyncMemoryServer()
+        server.tokens["phone-token"] = (seal.account, "phone")
+        return server
+    }
+
+    private func upload(_ record: Record, seal: Seal, server: SyncMemoryServer, succeeds: Bool = true) {
+        let done = expectation(description: "share upload finishes")
+        let upload = SharedLinkUpload(record: record, seal: seal, transport: server)
+        upload.start(base: base, token: "phone-token", within: 0.3) { success in
+            XCTAssertEqual(success, succeeds)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 2)
+        withExtendedLifetime(upload) {}
+    }
+
+    private func remote(_ server: SyncMemoryServer, seal: Seal, record: Record) throws -> Record {
+        server.lock.lock(); defer { server.lock.unlock() }
+        let stored = try XCTUnwrap(server.records[seal.account]?[seal.name(record.key)])
+        return try seal.open(XCTUnwrap(Data(base64Encoded: stored.blob)), name: seal.name(record.key))
+    }
+
+    func testQueueAloneDoesNotSyncButShareUploadReachesMacWithoutPhoneApp() throws {
+        let seal = Seal.make(), server = server(seal)
+        let queue = SharedLinkQueue(folder: folder)
+        let link = try prepared(seal)
+        XCTAssertTrue(queue.add(link))
+        XCTAssertNil(server.records[seal.account], "before: queuing alone sends nothing")
+        let record = try XCTUnwrap(SharedLinkSyncRecord.read(link)?.record)
+        let mac = try TestMac(server: server, seal: seal)
+        let live = expectation(description: "Mac online")
+        let arrived = expectation(description: "Mac receives shared tab")
+        mac.client.stateChanged = { if $0 == .live { live.fulfill() } }
+        mac.client.received = { records in
+            if records.contains(where: { $0.key == record.key }) { arrived.fulfill() }
+        }
+        mac.client.start()
+        defer { mac.client.stop() }
+        wait(for: [live], timeout: 2)
+        upload(record, seal: seal, server: server)
+        wait(for: [arrived], timeout: 2)
+        let tab = try XCTUnwrap(mac.journal.record(record.key).flatMap(SyncTab.init))
+        XCTAssertEqual(tab.url, "https://example.com/article")
+        XCTAssertEqual(tab.title, "An article")
+        XCTAssertEqual(tab.space, space)
+        XCTAssertEqual(tab.list, .kept)
+        XCTAssertNil(tab.device)
+        XCTAssertEqual(queue.count, 1, "the app's durable import remains")
+    }
+
+    func testLostAcknowledgmentThenAppImportUsesOneTabAndOriginalStamps() throws {
+        let seal = Seal.make(), server = server(seal)
+        server.holdsPushes = true
+        let link = try prepared(seal)
+        let record = try XCTUnwrap(SharedLinkSyncRecord.read(link)?.record)
+        upload(record, seal: seal, server: server, succeeds: false)
+        XCTAssertEqual(try remote(server, seal: seal, record: record), record)
+        let journal = try Journal(path: nil, device: "phone")
+        XCTAssertEqual(try journal.importLocal(record), record)
+        XCTAssertEqual(journal.pendingCount, 1)
+        server.letPushesGo()
+        let client = SyncClient(base: base, journal: journal, seal: seal,
+                                device: .init(id: "phone", name: "Phone", model: "iPhone"), transport: server)
+        let live = expectation(description: "phone catches up")
+        client.stateChanged = { if $0 == .live { live.fulfill() } }
+        client.start()
+        defer { client.stop() }
+        wait(for: [live], timeout: 2)
+        XCTAssertEqual(journal.record(record.key), record)
+        XCTAssertEqual(journal.pendingCount, 0)
+        XCTAssertEqual(journal.living(SyncCollection.tab).count, 1)
+    }
+
+    func testOfflineShareStaysQueuedAndCanBeImportedAfterRelaunch() throws {
+        let seal = Seal.make(), server = server(seal)
+        server.down = true
+        let queue = SharedLinkQueue(folder: folder)
+        let link = try prepared(seal)
+        XCTAssertTrue(queue.add(link))
+        let record = try XCTUnwrap(SharedLinkSyncRecord.read(link)?.record)
+        upload(record, seal: seal, server: server, succeeds: false)
+        XCTAssertTrue(queue.take(accept: { _ in false }).isEmpty)
+        XCTAssertEqual(queue.count, 1, "not discarded while the app's sync journal is still opening")
+        let journal = try Journal(path: folder.appendingPathComponent("import.sqlite").path, device: "phone")
+        _ = queue.take { saved in
+            guard let record = SharedLinkSyncRecord.read(saved)?.record else { return false }
+            return (try? journal.importLocal(record)) != nil
+        }
+        XCTAssertEqual(queue.count, 0)
+        let reopened = try Journal(path: folder.appendingPathComponent("import.sqlite").path, device: "phone")
+        XCTAssertEqual(reopened.record(record.key), record)
+        XCTAssertEqual(reopened.pendingCount, 1)
+    }
+
+    func testRepeatedSharesBeforeAppLaunchUseTheSameIdentity() throws {
+        let seal = Seal.make()
+        let first = try prepared(seal)
+        let again = try context(seal).prepare(first, pending: [first])
+        XCTAssertEqual(SharedLinkSyncRecord.read(first)?.record, SharedLinkSyncRecord.read(again)?.record)
+        let second = try context(seal).prepare(.init(action: .keep, address: "https://example.com/second"), pending: [first])
+        let a = try XCTUnwrap(SharedLinkSyncRecord.read(first)?.record["order"]?.string)
+        let b = try XCTUnwrap(SharedLinkSyncRecord.read(second)?.record["order"]?.string)
+        XCTAssertLessThan(a, b)
+    }
+
+    func testExistingTodayTabIsKeptWithItsIdentityAndServerEditsSurviveConflict() throws {
+        let seal = Seal.make(), server = server(seal)
+        let journal = try Journal(path: nil, device: "mac")
+        let tab = SyncTab(space: space, url: "https://example.com/article", title: "Original", device: "phone")
+        let original = try journal.change(.init(collection: SyncCollection.tab, id: tab.id), tab.fields)
+        upload(original, seal: seal, server: server)
+        let link = try context(seal, tabs: [original]).prepare(.init(action: .keep, address: tab.url), pending: [])
+        let kept = try XCTUnwrap(SharedLinkSyncRecord.read(link)?.record)
+        XCTAssertEqual(kept.id, original.id)
+        let renamed = try journal.change(original.key, ["name": "My name"])
+        upload(renamed, seal: seal, server: server)
+        upload(kept, seal: seal, server: server)
+        let result = try remote(server, seal: seal, record: kept)
+        XCTAssertEqual(result["name"]?.string, "My name")
+        XCTAssertEqual(SyncTab(result)?.list, .kept)
+        XCTAssertNil(SyncTab(result)?.device)
+    }
+
+    func testImportNeverRestoresATabDeletedOnMacOrChangesNewerFields() throws {
+        let seal = Seal.make()
+        let record = try XCTUnwrap(SharedLinkSyncRecord.read(prepared(seal))?.record)
+        let journal = try Journal(path: nil, device: "mac")
+        _ = try journal.receive([(record, 1)])
+        try journal.change(record.key, ["title": "A newer title"])
+        XCTAssertEqual(try journal.importLocal(record)["title"]?.string, "A newer title")
+        try journal.remove(record.key)
+        XCTAssertFalse(try journal.importLocal(record).alive())
+        let pending = journal.pendingCount
+        _ = try journal.importLocal(record)
+        XCTAssertEqual(journal.pendingCount, pending)
+    }
+
+    func testOtherAccountsPendingLinksAndOpenActionsAreNotUploaded() throws {
+        let seal = Seal.make(), other = Seal.make()
+        let first = try prepared(other)
+        let link = try context(seal).prepare(first, pending: [first])
+        XCTAssertNotEqual(SharedLinkSyncRecord.read(first)?.record.id, SharedLinkSyncRecord.read(link)?.record.id)
+        let open = SharedLink(action: .open, address: "https://example.com")
+        XCTAssertNil(try context(seal).prepare(open, pending: []).sync)
+        let search = SharedLink(action: .keep, address: "some words", search: true)
+        XCTAssertNil(try context(seal).prepare(search, pending: []).sync)
+    }
+
+    func testRevokedDeviceCannotUploadAndTheQueueStillHoldsItsLink() throws {
+        let seal = Seal.make(), server = server(seal)
+        server.devices[seal.account] = ["phone": .init(id: "phone", name: "Phone", model: "iPhone", revoked: true)]
+        let queue = SharedLinkQueue(folder: folder)
+        let link = try prepared(seal)
+        XCTAssertTrue(queue.add(link))
+        upload(try XCTUnwrap(SharedLinkSyncRecord.read(link)?.record), seal: seal, server: server, succeeds: false)
+        XCTAssertEqual(queue.count, 1)
+        XCTAssertNil(server.records[seal.account])
+    }
+}
