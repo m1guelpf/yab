@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import SyncKit
 import XCTest
 @testable import YabPhone
@@ -17,6 +18,73 @@ final class SharedLinkSyncTests: XCTestCase {
 
     private func context(_ seal: Seal, tabs: [Record] = []) -> SharedLinkSyncContext {
         .init(account: seal.account, device: "phone", base: base, space: space, tabs: tabs, lastOrder: "V")
+    }
+
+    func testSharedSnapshotAndQueuedRecordAreEncryptedAtRest() throws {
+        let seal = Seal.make(), key = SymmetricKey(size: .bits256)
+        let queue = SharedLinkQueue(folder: folder.appendingPathComponent("links"), protection: .init(key: { key }))
+        let link = try prepared(seal)
+        let record = try XCTUnwrap(SharedLinkSyncRecord.read(link)?.record)
+        try context(seal, tabs: [record]).save(for: queue)
+        XCTAssertTrue(queue.add(link))
+        let files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            .filter { !$0.hasDirectoryPath } + FileManager.default.contentsOfDirectory(at: queue.folder!, includingPropertiesForKeys: nil)
+        for file in files {
+            let data = try Data(contentsOf: file)
+            XCTAssertTrue(SharedLinkProtection.isSealed(data))
+            XCTAssertNil(data.range(of: Data("example.com".utf8)))
+            XCTAssertNil(data.range(of: Data("An article".utf8)))
+        }
+        XCTAssertEqual(SharedLinkSyncContext.read(for: queue)?.tabs, [record])
+        XCTAssertEqual(queue.take().first?.sync, link.sync)
+    }
+
+    func testUnavailableOrWrongKeyPreservesTheQueueAndNeverWritesPlaintext() throws {
+        let key = SymmetricKey(size: .bits256), wrongKey = SymmetricKey(size: .bits256)
+        let queue = SharedLinkQueue(folder: folder, protection: .init(key: { key }))
+        let link = try prepared(.make())
+        XCTAssertTrue(queue.add(link))
+        for protection in [SharedLinkProtection(key: { nil }), SharedLinkProtection(key: { wrongKey })] {
+            let unreadable = SharedLinkQueue(folder: folder, protection: protection)
+            XCTAssertTrue(unreadable.take().isEmpty)
+            XCTAssertTrue(unreadable.links.isEmpty)
+            XCTAssertEqual(unreadable.count, 1)
+        }
+        let locked = SharedLinkQueue(folder: folder, protection: .init(key: { nil }))
+        XCTAssertFalse(locked.add(link))
+        XCTAssertEqual(queue.take().first?.sync, link.sync)
+    }
+
+    func testSnapshotRejectsTamperingWrongPurposeAndOldPlaintext() throws {
+        let seal = Seal.make(), key = SymmetricKey(size: .bits256)
+        let protection = SharedLinkProtection(key: { key })
+        let queue = SharedLinkQueue(folder: folder.appendingPathComponent("links"), protection: protection)
+        let snapshot = context(seal)
+        try snapshot.save(for: queue)
+        let file = try XCTUnwrap(SharedLinkSyncContext.file(for: queue))
+        let data = try Data(contentsOf: file)
+        XCTAssertNil(protection.open(data, purpose: "yab.shared.link.v1"))
+        let wrong = SharedLinkQueue(folder: queue.folder, protection: .init(key: { SymmetricKey(size: .bits256) }))
+        XCTAssertNil(SharedLinkSyncContext.read(for: wrong))
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
+        var cipher = try XCTUnwrap(json["sealed"].flatMap { Data(base64Encoded: $0) })
+        cipher[cipher.count - 1] ^= 1
+        json["sealed"] = cipher.base64EncodedString()
+        try JSONSerialization.data(withJSONObject: json).write(to: file)
+        XCTAssertNil(SharedLinkSyncContext.read(for: queue))
+        try JSONEncoder().encode(snapshot).write(to: file)
+        XCTAssertNil(SharedLinkSyncContext.read(for: queue))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    func testLegacyQueueEntriesRemainReadable() throws {
+        let plain = SharedLinkQueue(folder: folder)
+        let link = SharedLink(action: .keep, address: "https://example.com/legacy", title: "Legacy")
+        XCTAssertTrue(plain.add(link))
+        let key = SymmetricKey(size: .bits256)
+        let secured = SharedLinkQueue(folder: folder, protection: .init(key: { key }))
+        XCTAssertEqual(secured.take().first?.address, link.address)
+        XCTAssertEqual(secured.count, 0)
     }
 
     private func prepared(_ seal: Seal) throws -> SharedLink {

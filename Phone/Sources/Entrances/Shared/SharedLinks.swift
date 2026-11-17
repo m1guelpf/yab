@@ -1,4 +1,53 @@
 import Foundation
+import CryptoKit
+import Security
+
+/// Local encryption for the app and share extension. This key is separate
+/// from Sync, so turning Sync off cannot strand an unsent shared link.
+struct SharedLinkProtection: Sendable {
+    var key: @Sendable () -> SymmetricKey?
+
+    static let keychain = Self {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                   kSecAttrService as String: "Yab shared links",
+                                   kSecAttrAccount as String: "local encryption",
+                                   kSecUseDataProtectionKeychain as String: true]
+        func read() -> SymmetricKey? {
+            var request = query
+            request[kSecReturnData as String] = true
+            var result: CFTypeRef?
+            guard SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess,
+                  let data = result as? Data, data.count == 32 else { return nil }
+            return SymmetricKey(data: data)
+        }
+        if let key = read() { return key }
+        var add = query
+        add[kSecValueData as String] = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let result = SecItemAdd(add as CFDictionary, nil)
+        guard result == errSecSuccess || result == errSecDuplicateItem else { return nil }
+        return read()
+    }
+
+    private struct Envelope: Codable { var sealed: Data }
+
+    func seal(_ data: Data, purpose: String) throws -> Data {
+        guard let key = key() else { throw CocoaError(.fileWriteNoPermission) }
+        let box = try AES.GCM.seal(data, using: key, authenticating: Data(purpose.utf8))
+        guard let combined = box.combined else { throw CryptoKitError.incorrectParameterSize }
+        return try JSONEncoder().encode(Envelope(sealed: combined))
+    }
+
+    func open(_ data: Data, purpose: String) -> Data? {
+        guard let key = key(), let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
+              let box = try? AES.GCM.SealedBox(combined: envelope.sealed) else { return nil }
+        return try? AES.GCM.open(box, using: key, authenticating: Data(purpose.utf8))
+    }
+
+    static func isSealed(_ data: Data) -> Bool {
+        (try? JSONDecoder().decode(Envelope.self, from: data)) != nil
+    }
+}
 
 /// A link handed to Yab from another app's share sheet: opened as a tab, or
 /// kept for later without opening Yab. The share extension (Phone/Share)
@@ -55,15 +104,17 @@ struct SharedLinkQueue: Sendable {
     /// Where the files are; nil when the App Group isn't granted (a build
     /// without its entitlement), and then nothing is queued.
     let folder: URL?
+    let protection: SharedLinkProtection?
 
-    init(folder: URL?) {
+    init(folder: URL?, protection: SharedLinkProtection? = nil) {
         self.folder = folder
+        self.protection = protection
     }
 
     /// The App Group's queue, shared by the app and the extension.
     static var shared: SharedLinkQueue {
         let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
-        return SharedLinkQueue(folder: container?.appendingPathComponent("Shared Links", isDirectory: true))
+        return SharedLinkQueue(folder: container?.appendingPathComponent("Shared Links", isDirectory: true), protection: .keychain)
     }
 
     /// Queues a link; false when it couldn't be written.
@@ -77,7 +128,9 @@ struct SharedLinkQueue: Sendable {
             // Named by the moment, so the names sort oldest first.
             let millis = Int64((link.date.timeIntervalSince1970 * 1000).rounded())
             let name = String(format: "%014lld-", millis) + UUID().uuidString + ".json"
-            try encoder.encode(link).write(to: folder.appendingPathComponent(name), options: .atomic)
+            let plain = try encoder.encode(link)
+            let data = try protection?.seal(plain, purpose: "yab.shared.link.v1") ?? plain
+            try data.write(to: folder.appendingPathComponent(name), options: .atomic)
         } catch {
             return false
         }
@@ -88,10 +141,11 @@ struct SharedLinkQueue: Sendable {
     /// Accepted links, oldest first, removed only after their import.
     /// Rejected links stay for a retry. Invalid files are removed too.
     func take(accept: (SharedLink) -> Bool = { _ in true }) -> [SharedLink] {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
         return entries().compactMap { file in
-            guard let data = try? Data(contentsOf: file), let link = try? decoder.decode(SharedLink.self, from: data) else {
+            guard let data = try? Data(contentsOf: file) else { return nil }
+            guard let link = decode(data) else {
+                // A locked or unavailable key is not a corrupt queue entry.
+                if SharedLinkProtection.isSealed(data) { return nil }
                 try? FileManager.default.removeItem(at: file)
                 return nil
             }
@@ -104,11 +158,20 @@ struct SharedLinkQueue: Sendable {
     /// Pending records also supply identities for repeated shares before
     /// the app has opened and refreshed its snapshot.
     var links: [SharedLink] {
+        return entries().compactMap { file in
+            (try? Data(contentsOf: file)).flatMap(decode)
+        }
+    }
+
+    private func decode(_ data: Data) -> SharedLink? {
+        let plain: Data
+        if SharedLinkProtection.isSealed(data) {
+            guard let opened = protection?.open(data, purpose: "yab.shared.link.v1") else { return nil }
+            plain = opened
+        } else { plain = data } // Keep links saved by an older app readable.
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return entries().compactMap { file in
-            (try? Data(contentsOf: file)).flatMap { try? decoder.decode(SharedLink.self, from: $0) }
-        }
+        return try? decoder.decode(SharedLink.self, from: plain)
     }
 
     /// How many links wait, without taking them.

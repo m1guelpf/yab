@@ -16,13 +16,25 @@ struct SharedLinkSyncContext: Codable {
     }
 
     static func read(for queue: SharedLinkQueue) -> Self? {
-        file(for: queue).flatMap { try? Data(contentsOf: $0) }.flatMap { try? JSONDecoder().decode(Self.self, from: $0) }
+        guard let file = file(for: queue), let data = try? Data(contentsOf: file) else { return nil }
+        // Discard the unencrypted snapshot from earlier development builds.
+        guard SharedLinkProtection.isSealed(data) else {
+            try? FileManager.default.removeItem(at: file)
+            return nil
+        }
+        return queue.protection?.open(data, purpose: "yab.shared.context.v1")
+            .flatMap { try? JSONDecoder().decode(Self.self, from: $0) }
     }
 
     func save(for queue: SharedLinkQueue) throws {
-        guard let file = Self.file(for: queue) else { return }
+        guard let file = Self.file(for: queue) else { throw CocoaError(.fileWriteNoPermission) }
+        if let old = try? Data(contentsOf: file), !SharedLinkProtection.isSealed(old) {
+            try FileManager.default.removeItem(at: file)
+        }
+        guard let protection = queue.protection else { throw CocoaError(.fileWriteNoPermission) }
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder().encode(self).write(to: file, options: .atomic)
+        let data = try protection.seal(JSONEncoder().encode(self), purpose: "yab.shared.context.v1")
+        try data.write(to: file, options: .atomic)
     }
 
     /// Kept links use the same URL rules as SharedItems. Text-only shares
