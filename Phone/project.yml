@@ -178,6 +178,7 @@ targets:
         YabSyncKeychainGroups:
           - $(AppIdentifierPrefix)dev.serafim.fast
           - $(AppIdentifierPrefix)dev.serafim.fast.sync
+        YabShareKeychainGroup: $(AppIdentifierPrefix)dev.serafim.fast.iphone.share
         # Where the day's count and crash reports go (Reports/): only the
         # Release build (TestFlight, the App Store) has a site; Debug's is
         # empty and sends nothing.
@@ -282,7 +283,6 @@ targets:
       - path: Sources/Design/DateOrder.swift  # Date >=/<= of our own (DateOrder.swift)
       - path: Sources/Entrances/Shared/SharedLinks.swift
       - path: Sources/Entrances/Shared/SharedLinkSync.swift
-      - path: Sources/Sync/SyncKeychain.swift
       - path: Sources/Entrances/Shared/YabRoute.swift
       - path: Sources/Entrances/Shared/EntranceLook.swift
       - path: Sources/Entrances/Shared/ShareCard.swift
@@ -295,6 +295,7 @@ targets:
       path: Share/Info.plist
       properties:
         CFBundleDisplayName: Yab
+        YabShareKeychainGroup: $(AppIdentifierPrefix)dev.serafim.fast.iphone.share
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSExtension:

@@ -1,6 +1,50 @@
 import Foundation
 import SyncKit
 
+/// A single sign-in's authority in the extension's private Keychain group.
+/// The phone's Sync and iCloud groups are never granted to the extension.
+struct SharedLinkSyncAccess: Sendable {
+    struct Session: Codable, Equatable, Sendable {
+        var id = UUID()
+        var key: Data
+        var token: String
+        var device: String
+        var seal: Seal? { Seal(raw: key) }
+    }
+
+    let secrets: SharedLinkSecrets
+
+    static var standard: Self {
+        Self(secrets: .standard)
+    }
+
+    var session: Session? {
+        secrets.read("sync-session").flatMap { try? JSONDecoder().decode(Session.self, from: $0) }
+    }
+
+    @discardableResult
+    func grant(seal: Seal, token: String, device: String) -> Session? {
+        guard !token.isEmpty, !device.isEmpty else { return nil }
+        if let old = session, old.key == seal.raw, old.token == token, old.device == device { return old }
+        let next = Session(key: seal.raw, token: token, device: device)
+        guard let data = try? JSONEncoder().encode(next), secrets.write(data, "sync-session") else { return nil }
+        return next
+    }
+
+    func revoke() {
+        secrets.remove("sync-session")
+    }
+
+    /// Read immediately before each open or send, including conflict replies.
+    /// An upload already sent cannot be recalled; a cached session grants no
+    /// authority for a new attempt after sign-out or a later sign-in.
+    func whileAuthorized(_ session: Session, perform action: () -> Void) -> Bool {
+        guard self.session == session else { return false }
+        action()
+        return true
+    }
+}
+
 /// A small snapshot of the last ordinary space. Credentials stay in the
 /// keychain; the extension never opens the app's live journal.
 struct SharedLinkSyncContext: Codable {
@@ -90,15 +134,20 @@ final class SharedLinkUpload: @unchecked Sendable {
     private let queue = DispatchQueue(label: "phone.share-sync")
     private let transport: any Transport
     private let seal: Seal
+    private let access: SharedLinkSyncAccess
+    private let session: SharedLinkSyncAccess.Session
     private var record: Record
     private var line: (any Line)?
     private var completion: ((Bool) -> Void)?
     private var timeout: DispatchWorkItem?
     private var requestID = 0
 
-    init(record: Record, seal: Seal, transport: any Transport = WebTransport()) {
+    init?(record: Record, access: SharedLinkSyncAccess, session: SharedLinkSyncAccess.Session, transport: any Transport = WebTransport()) {
+        guard let seal = session.seal else { return nil }
         self.record = record
         self.seal = seal
+        self.access = access
+        self.session = session
         self.transport = transport
     }
 
@@ -107,20 +156,22 @@ final class SharedLinkUpload: @unchecked Sendable {
         line?.close()
     }
 
-    func start(base: URL, token: String, within seconds: TimeInterval = 5, completion: @escaping (Bool) -> Void) {
+    func start(base: URL, within seconds: TimeInterval = 5, completion: @escaping (Bool) -> Void) {
         queue.async { [self] in
             self.completion = completion
             var parts = URLComponents(url: base.appendingPathComponent("v1/accounts/\(seal.account)/socket"), resolvingAgainstBaseURL: false)
             parts?.scheme = base.scheme == "http" ? "ws" : "wss"
             guard let url = parts?.url else { return finish(false) }
             var request = URLRequest(url: url)
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue("Bearer \(session.token)", forHTTPHeaderField: "Authorization")
             request.setValue(String(AndroidSyncCompatibility.version), forHTTPHeaderField: "X-Yab-Android-Sync")
-            line = transport.open(request, received: { [weak self] text in
-                self?.queue.async { self?.received(text) }
-            }, closed: { [weak self] _ in
-                self?.queue.async { self?.finish(false) }
-            })
+            guard access.whileAuthorized(session, perform: {
+                line = transport.open(request, received: { [weak self] text in
+                    self?.queue.async { self?.received(text) }
+                }, closed: { [weak self] _ in
+                    self?.queue.async { self?.finish(false) }
+                })
+            }) else { return finish(false) }
             let timeout = DispatchWorkItem { [weak self] in self?.finish(false) }
             self.timeout = timeout
             queue.asyncAfter(deadline: .now() + seconds, execute: timeout)
@@ -136,7 +187,9 @@ final class SharedLinkUpload: @unchecked Sendable {
             let change: [String: Any] = ["name": seal.name(record.key), "base": version,
                                          "blob": try seal.seal(record).base64EncodedString()]
             let data = try JSONSerialization.data(withJSONObject: ["t": "push", "id": "share-\(requestID)", "changes": [change]])
-            line?.send(String(decoding: data, as: UTF8.self))
+            guard access.whileAuthorized(session, perform: {
+                line?.send(String(decoding: data, as: UTF8.self))
+            }) else { return finish(false) }
         } catch { finish(false) }
     }
 

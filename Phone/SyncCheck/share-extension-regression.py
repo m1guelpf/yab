@@ -44,7 +44,14 @@ for old, new in replacements.items():
     assert controller.count(old) == 1, old
     controller = controller.replace(old, new)
 has_sync = (out / "Phone/Sources/Entrances/Shared/SharedLinkSync.swift").exists()
-if has_sync:
+has_access = "private let syncAccess = SharedLinkSyncAccess.standard" in controller
+if has_access:
+    controller = controller.replace("private let syncAccess = SharedLinkSyncAccess.standard",
+                                    "private var syncAccess: SharedLinkSyncAccess { ShareExtensionFixture.syncAccess! }")
+    upload = "SharedLinkUpload(record: payload.record, access: syncAccess, session: session)"
+    assert controller.count(upload) == 1
+    controller = controller.replace(upload, upload[:-1] + ", transport: ShareExtensionFixture.transport)")
+elif has_sync:
     assert controller.count("SyncKeychain.standard()") == 1
     assert controller.count("SharedLinkUpload(record: payload.record, seal: seal)") == 1
 controller = controller.replace("SyncKeychain.standard()", "ShareExtensionFixture.keys")
@@ -57,6 +64,8 @@ text = project.read_text()
 defines = "$(inherited) SHARE_EXTENSION_REGRESSION"
 if has_sync:
     defines += " SHARE_SYNC_CONTEXT"
+if has_access:
+    defines += " SHARE_SYNC_ACCESS"
 marker = "        PRODUCT_BUNDLE_IDENTIFIER: dev.serafim.fast.iphone.tests"
 assert text.count(marker) == 1
 text = text.replace(marker, marker + '\n        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "' + defines + '"')

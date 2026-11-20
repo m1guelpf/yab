@@ -6,6 +6,9 @@ import XCTest
 
 final class SharedLinkSyncTests: XCTestCase {
     private var folder: URL!
+    private var access: SharedLinkSyncAccess {
+        .init(secrets: .init(storage: .files(folder.appendingPathComponent("secrets"))))
+    }
     private let space = UUID().uuidString
     private let base = URL(string: "https://sync.test")!
 
@@ -99,13 +102,89 @@ final class SharedLinkSyncTests: XCTestCase {
 
     private func upload(_ record: Record, seal: Seal, server: SyncMemoryServer, succeeds: Bool = true) {
         let done = expectation(description: "share upload finishes")
-        let upload = SharedLinkUpload(record: record, seal: seal, transport: server)
-        upload.start(base: base, token: "phone-token", within: 0.3) { success in
+        let session = access.grant(seal: seal, token: "phone-token", device: "phone")!
+        let upload = SharedLinkUpload(record: record, access: access, session: session, transport: server)!
+        upload.start(base: base, within: 0.3) { success in
             XCTAssertEqual(success, succeeds)
             done.fulfill()
         }
         wait(for: [done], timeout: 2)
         withExtendedLifetime(upload) {}
+    }
+
+    func testRevokedSessionCannotOpenAConnectionEvenAfterSigningInAgain() throws {
+        let seal = Seal.make(), server = server(seal)
+        let record = try XCTUnwrap(SharedLinkSyncRecord.read(prepared(seal))?.record)
+        let session = try XCTUnwrap(access.grant(seal: seal, token: "phone-token", device: "phone"))
+        let upload = try XCTUnwrap(SharedLinkUpload(record: record, access: access, session: session, transport: server))
+        access.revoke()
+        XCTAssertNil(access.session)
+        XCTAssertNil(access.secrets.read("sync-session"))
+        let next = try XCTUnwrap(access.grant(seal: seal, token: "phone-token", device: "phone"))
+        XCTAssertNotEqual(session.id, next.id)
+        let done = expectation(description: "the old upload is refused locally")
+        upload.start(base: base) { success in
+            XCTAssertFalse(success)
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 2)
+        XCTAssertTrue(server.sockets.isEmpty)
+        XCTAssertNil(server.records[seal.account])
+    }
+
+    private final class HeldTransport: Transport, Line, @unchecked Sendable {
+        let lock = NSLock()
+        var received: ((String) -> Void)?
+        var firstSend: (() -> Void)?
+        private(set) var sent: [String] = []
+        func request(_ request: URLRequest, _ done: @escaping (Int?, Data?) -> Void) { XCTFail("no registration from a share") }
+        func open(_ request: URLRequest, received: @escaping (String) -> Void, closed: @escaping (Int?) -> Void) -> any Line {
+            lock.lock(); self.received = received; lock.unlock()
+            return self
+        }
+        func send(_ text: String) {
+            lock.lock(); sent.append(text); let callback = firstSend; firstSend = nil; lock.unlock()
+            callback?()
+        }
+        func close() {}
+        func reply(_ message: [String: Any]) throws {
+            let text = String(decoding: try JSONSerialization.data(withJSONObject: message), as: UTF8.self)
+            lock.lock(); let callback = received; lock.unlock()
+            callback?(text)
+        }
+    }
+
+    func testSignOutStopsAConflictRetryFromAnAlreadyOpenShare() throws {
+        let seal = Seal.make()
+        let record = try XCTUnwrap(SharedLinkSyncRecord.read(prepared(seal))?.record)
+        let session = try XCTUnwrap(access.grant(seal: seal, token: "phone-token", device: "phone"))
+        let transport = HeldTransport()
+        let sent = expectation(description: "first push is in flight")
+        transport.firstSend = { sent.fulfill() }
+        let done = expectation(description: "sign-out cancels the conflict retry")
+        let upload = try XCTUnwrap(SharedLinkUpload(record: record, access: access, session: session, transport: transport))
+        upload.start(base: base) { success in
+            XCTAssertFalse(success)
+            done.fulfill()
+        }
+        wait(for: [sent], timeout: 2)
+        access.revoke()
+        // An older server record would normally require a second push.
+        let old = Record(collection: record.collection, id: record.id)
+        try transport.reply(["t": "pushed", "id": "share-1", "accepted": [],
+                             "conflicts": [["name": seal.name(record.key), "version": 1,
+                                            "blob": try seal.seal(old).base64EncodedString()]]])
+        wait(for: [done], timeout: 2)
+        XCTAssertEqual(transport.sent.count, 1)
+    }
+
+    func testPreviousQueueKeyRemainsReadableAfterTheExtensionWritesANewKey() throws {
+        let oldKey = SymmetricKey(size: .bits256), newKey = SymmetricKey(size: .bits256)
+        let old = SharedLinkQueue(folder: folder, protection: .init(key: { oldKey }))
+        let link = SharedLink(action: .keep, address: "https://example.test/before-update")
+        XCTAssertTrue(old.add(link))
+        let migrated = SharedLinkQueue(folder: folder, protection: .init(key: { newKey }, legacyKey: { oldKey }))
+        XCTAssertEqual(migrated.take().first?.address, link.address)
     }
 
     private func remote(_ server: SyncMemoryServer, seal: Seal, record: Record) throws -> Record {

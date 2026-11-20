@@ -19,6 +19,7 @@ final class ShareViewController: UIViewController {
 
     private let model = Model()
     private let queue = SharedLinkQueue.shared
+    private let syncAccess = SharedLinkSyncAccess.standard
     private var upload: SharedLinkUpload?
     private var ended = false
 
@@ -86,12 +87,10 @@ final class ShareViewController: UIViewController {
     private func choose(_ action: SharedLink.Action) {
         guard let found = model.found, model.phase == .ready else { return }
         var link = SharedLink(action: action, address: found.address, search: found.search, title: found.title)
-        let keys = SyncKeychain.standard()
+        let session = syncAccess.session
         let context = SharedLinkSyncContext.read(for: queue)
-        let seal = keys.local
-        let token = keys.token
-        if action == .keep, let context, context.account == seal?.account,
-           context.device == keys.existingDeviceID, token != nil {
+        if action == .keep, let context, let session, context.account == session.seal?.account,
+           context.device == session.device {
             link = (try? context.prepare(link, pending: queue.links)) ?? link
         }
         let queued = queue.add(link)
@@ -101,10 +100,10 @@ final class ShareViewController: UIViewController {
             // Said where the buttons were, then the sheet goes: nothing else shows it.
             model.phase = .kept
             let earliest = DispatchTime.now() + 0.8
-            if let payload = SharedLinkSyncRecord.read(link), let seal, let token, let context {
-                let upload = SharedLinkUpload(record: payload.record, seal: seal)
+            if let payload = SharedLinkSyncRecord.read(link), let session, let context,
+               let upload = SharedLinkUpload(record: payload.record, access: syncAccess, session: session) {
                 self.upload = upload
-                upload.start(base: context.base, token: token) { [weak self] _ in
+                upload.start(base: context.base) { [weak self] _ in
                     DispatchQueue.main.asyncAfter(deadline: earliest) { self?.finish() }
                 }
             } else {

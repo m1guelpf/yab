@@ -912,9 +912,13 @@ final class SyncBridgeTests: XCTestCase {
         XCTAssertEqual(spaceNames(mac), ["Personal", "Reading", "Trips", "Work"])
         let before = Dictionary(uniqueKeysWithValues: mine.map { tab in (tab.url!, living(mac).first { $0.url == tab.url }!.id) })
         let oldDevice = keys.deviceID
+        let shareAccess = setup(server, ownWorld: false).shareAccess
+        let oldShareSession = try XCTUnwrap(shareAccess.session)
 
         await leave(app, server)
         XCTAssertEqual(app.sync.phase == .on, false)
+        XCTAssertNil(shareAccess.session, "turn-off and remote removal both revoke the extension")
+        XCTAssertNil(shareAccess.secrets.read("sync-session"))
         // Used while out: a page of today's opened in Trips.
         let packing = PageFixtures.liveTab(for: URL(string: "https://example.org/packing")!)
         app.browser.open(packing, in: trips)
@@ -923,6 +927,8 @@ final class SyncBridgeTests: XCTestCase {
         XCTAssertNotEqual(keys.deviceID, oldDevice, "joined again as a new device")
         let back = await until(8) { app.sync.line == .live && app.sync.writing && app.sync.pending == 0 }
         XCTAssertTrue(back, "\(app.sync.line)")
+        XCTAssertNotEqual(shareAccess.session?.id, oldShareSession.id)
+        XCTAssertEqual(shareAccess.session?.device, keys.deviceID)
         await settle(mac, app)
 
         XCTAssertEqual(spaceNames(mac), ["Personal", "Reading", "Trips", "Work"], "no space came back twice")
@@ -949,6 +955,54 @@ final class SyncBridgeTests: XCTestCase {
             app.sync.turnOff()
             XCTAssertEqual(app.sync.phase, .off)
         }
+    }
+
+    func testOfflineSignOutRevokesAnOpenShareAndPreservesTheEncryptedQueue() async throws {
+        let wasTurnedOff = SettingsStore.shared.syncTurnedOff
+        defer { SettingsStore.shared.syncTurnedOff = wasTurnedOff }
+        let server = SyncMemoryServer(), seal = Seal.make()
+        let mac = try await macWithWork(server, seal)
+        defer { mac.client.stop() }
+        let app = try await phone(server, seal, ownWorld: false, fixturesEnabled: false)
+        defer { app.sync.end() }
+        let configuration = setup(server, ownWorld: false)
+        let access = configuration.shareAccess, queue = configuration.sharedLinks
+        let ready = await until { access.session != nil && app.sync.shareContext() != nil }
+        XCTAssertTrue(ready)
+        let session = try XCTUnwrap(access.session)
+        let context = try XCTUnwrap(SharedLinkSyncContext.read(for: queue))
+        let link = try context.prepare(.init(action: .keep, address: "https://example.test/before-sign-out"), pending: [])
+        XCTAssertTrue(queue.add(link))
+        let record = try XCTUnwrap(SharedLinkSyncRecord.read(link)?.record)
+        let openedBeforeSignOut = try XCTUnwrap(SharedLinkUpload(record: record, access: access, session: session, transport: server))
+
+        server.cut()
+        app.sync.turnOff()
+        XCTAssertEqual(app.sync.phase, .off)
+        XCTAssertNil(access.session)
+        XCTAssertNil(access.secrets.read("sync-session"))
+        XCTAssertNil(configuration.keys.local)
+        XCTAssertNil(configuration.keys.token)
+        XCTAssertNil(SharedLinkSyncContext.read(for: queue))
+        app.sync.wentToBack()
+        XCTAssertNil(access.session, "a later lifecycle callback cannot restore authority")
+
+        // The old server token is still valid: local sign-out must suffice
+        // even when the server could not hear the removal request.
+        server.lock.lock(); server.down = false; server.lock.unlock()
+        let done = expectation(description: "the open share cannot upload after sign-out")
+        openedBeforeSignOut.start(base: context.base) { success in
+            XCTAssertFalse(success)
+            done.fulfill()
+        }
+        await fulfillment(of: [done], timeout: 2)
+        server.lock.lock()
+        let remote = server.records[seal.account]?[seal.name(record.key)]
+        server.lock.unlock()
+        XCTAssertNil(remote)
+        XCTAssertEqual(queue.take().first?.address, link.address, "sign-out preserves locally saved links")
+        XCTAssertTrue(queue.add(.init(action: .keep, address: "https://example.test/after-sign-out")))
+        XCTAssertEqual(queue.take().first?.address, "https://example.test/after-sign-out")
     }
 
     func testJoinAgainAfterRemovalAddsNoSpaceAndLosesNoTab() async throws {

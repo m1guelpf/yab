@@ -10,6 +10,9 @@ import XCTest
 enum ShareExtensionFixture {
     static var queue = SharedLinkQueue(folder: nil)
     static var keys = SyncKeychain.testing(folder: FileManager.default.temporaryDirectory)
+#if SHARE_SYNC_ACCESS
+    static var syncAccess: SharedLinkSyncAccess?
+#endif
     static var transport: any Transport = SyncMemoryServer()
 }
 
@@ -49,6 +52,11 @@ final class ShareExtensionRegressionTests: XCTestCase {
         ShareExtensionFixture.queue = SharedLinkQueue(folder: queueFolder)
 #endif
         ShareExtensionFixture.keys = keys
+#if SHARE_SYNC_ACCESS
+        let access = SharedLinkSyncAccess(secrets: .init(storage: .files(folder.appendingPathComponent("share-secrets"))))
+        XCTAssertNotNil(access.grant(seal: seal, token: "share-test-token", device: device))
+        ShareExtensionFixture.syncAccess = access
+#endif
         ShareExtensionFixture.transport = server
         let controller = ShareViewController()
         controller.model.found = .init(address: address, search: false, title: "Shared from Safari")
@@ -60,5 +68,45 @@ final class ShareExtensionRegressionTests: XCTestCase {
         XCTAssertEqual(mac.journal.living(SyncCollection.tab).filter { $0["url"]?.string == address }.count, 1)
         XCTAssertEqual(ShareExtensionFixture.queue.count, 1, "the local import remains durable")
     }
+
+#if SHARE_SYNC_ACCESS
+    func testShareSheetOpenedBeforeSignOutCannotUseStaleContext() async throws {
+        let wasTurnedOff = SettingsStore.shared.syncTurnedOff
+        defer { SettingsStore.shared.syncTurnedOff = wasTurnedOff }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("share-signout-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let server = SyncMemoryServer(), seal = Seal.make()
+        let keys = SyncKeychain.testing(folder: folder.appendingPathComponent("keys"))
+        keys.keep(seal, share: false)
+        let setup = SyncBridge.Setup(base: URL(string: "https://sync.test")!, keys: keys,
+                                    folder: folder.appendingPathComponent("journal"), seed: false, makesKey: false,
+                                    deviceName: "Test iPhone", transport: server, ownWorld: false)
+        let profile = BrowserProfile(folder: folder.appendingPathComponent("profile"))
+        let app = AppModel(world: profile.world, fixturesEnabled: false, profile: profile)
+        app.sync.attach(app, setup: setup)
+        defer { app.sync.end() }
+        let deadline = Date().addingTimeInterval(3)
+        while setup.shareAccess.session == nil && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNotNil(setup.shareAccess.session)
+        let context = try XCTUnwrap(SharedLinkSyncContext.read(for: setup.sharedLinks))
+        ShareExtensionFixture.queue = setup.sharedLinks
+        ShareExtensionFixture.syncAccess = setup.shareAccess
+        ShareExtensionFixture.transport = server
+        let controller = ShareViewController()
+        controller.model.found = .init(address: "https://example.test/after-sign-out", search: false, title: "Saved offline")
+        controller.model.phase = .ready
+
+        server.cut()
+        app.sync.turnOff()
+        // Even an old snapshot left by a concurrent reader grants no authority.
+        try context.save(for: setup.sharedLinks)
+        controller.choose(.keep)
+        let saved = try XCTUnwrap(setup.sharedLinks.links.first)
+        XCTAssertNil(saved.sync)
+        XCTAssertEqual(saved.address, "https://example.test/after-sign-out")
+        XCTAssertEqual(controller.model.phase, .kept)
+        XCTAssertNil(setup.shareAccess.session)
+    }
+#endif
 }
 #endif

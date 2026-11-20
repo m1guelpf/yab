@@ -284,6 +284,23 @@ final class SyncBridge {
         /// local profile is preserved and imported independently of this flag.
         var ownWorld = true
 
+        var shareAccess: SharedLinkSyncAccess {
+            switch keys.storage {
+            case .keychain: return .standard
+            case let .files(folder):
+                return SharedLinkSyncAccess(secrets: .init(storage: .files(folder.appendingPathComponent("share"))))
+            }
+        }
+
+        var sharedLinks: SharedLinkQueue {
+            switch keys.storage {
+            case .keychain: return .shared
+            case let .files(folder):
+                return SharedLinkQueue(folder: folder.deletingLastPathComponent().appendingPathComponent("Shared/Links"),
+                                       protection: .using(shareAccess.secrets))
+            }
+        }
+
         /// The launch's: `-YabSync <url>` (a local server), a world's own
         /// `"sync"` section, else for a person's launch the keychain and the
         /// deployed server. Test runs never reach the deployed server, and
@@ -353,6 +370,7 @@ final class SyncBridge {
         watchFront()
         watchLiveTaskVisibility()
         guard let setup = adjusted else { return }
+        revokeShareAccess()
         // A test's fresh start: no key, no journal of an earlier run.
         if Self.argument("YabSyncFresh") == "1", case let .files(keys) = setup.keys.storage {
             try? FileManager.default.removeItem(at: keys)
@@ -912,6 +930,7 @@ final class SyncBridge {
         if !mirror.spaces.isEmpty || setup?.seed == true {
             // The seed: the world is this iPhone's own, it all goes up as changes.
             takeAccount()
+            publishShareContext()
         }
         adoptChats(nil)
         reconcileLiveTasks()
@@ -990,6 +1009,7 @@ final class SyncBridge {
             // Caught up: a joining iPhone takes the account's spaces now,
             // and from here on writes its own.
             takeAccount()
+            publishShareContext()
             Entrances.resumeShared()
             pruneEmptyPersonals()
             countPending()
@@ -998,6 +1018,7 @@ final class SyncBridge {
             prepareAssistantNotifications()
             reconcileAssistantApprovals()
         case let .refused(why):
+            revokeShareAccess()
             let words = why.replacingOccurrences(of: "This Mac", with: "This iPhone")
             folderArtwork.reset()
             phase = .refused(words)
@@ -2467,6 +2488,7 @@ final class SyncBridge {
         defer { reconcileLiveTasks() }
         guard phase == .on, let engine else { return }
         settings.syncTurnedOff = true
+        revokeShareAccess()
         engine.leave { _ in }
         forgetAccount()
         pairing?.cancel()
@@ -2484,9 +2506,7 @@ final class SyncBridge {
 
     /// The journal, key, token and id let go: what Join Again and Turn Off share.
     private func forgetAccount(keepingKey: Bool = false) {
-        if setup?.ownWorld == false, let file = SharedLinkSyncContext.file(for: .shared) {
-            try? FileManager.default.removeItem(at: file)
-        }
+        revokeShareAccess()
         folderArtwork.reset()
         settings.importSearchPreferences(engine: nil, customTemplate: nil)
         importShield([:])
@@ -2510,12 +2530,24 @@ final class SyncBridge {
     /// The share extension uses only the last ordinary space's tab records.
     /// It never needs the account's chats, history or credentials in a file.
     private func publishShareContext() {
-        guard app?.isFixture == false, setup?.ownWorld == false, let context = shareContext() else { return }
-        try? context.save(for: .shared)
+        guard app?.isFixture == false, let setup, !setup.ownWorld, let engine,
+              let context = shareContext(), let token = setup.keys.token else { return }
+        do {
+            try context.save(for: setup.sharedLinks)
+            setup.shareAccess.grant(seal: engine.seal, token: token, device: engine.device)
+        } catch { revokeShareAccess() }
+    }
+
+    private func revokeShareAccess() {
+        guard let setup else { return }
+        setup.shareAccess.revoke()
+        if let file = SharedLinkSyncContext.file(for: setup.sharedLinks) {
+            try? FileManager.default.removeItem(at: file)
+        }
     }
 
     func shareContext() -> SharedLinkSyncContext? {
-        guard let app, let engine, ready, writing else { return nil }
+        guard phase == .on, let app, let engine, ready, writing else { return nil }
         let local = app.browser.space.isPrivate ? app.browser.ordinarySpaceID : app.browser.spaceID
         guard let space = ids.known(local),
               engine.journal.record(.init(collection: SyncCollection.space, id: space)).flatMap(SyncSpace.init) != nil else { return nil }
